@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"time"
+	"log"
 )
 
 type Packet struct {
@@ -57,10 +58,10 @@ func ReadPacket(r io.Reader) (Packet, error) {
 }
 
 type streamState struct {
-	UnacknowledgedBufSize   uint64
-	UnacknowledgedByteCount uint64
-	UnacknowledgedStreamPos uint64
 	CurrentReadStreamPos    uint64
+	UnacknowledgedBufSize   uint64
+	UnacknowledgedStreamPos uint64
+	UnacknowledgedBytes     []byte
 }
 
 func SendRecvStreamState(rw io.ReadWriter, s streamState) (streamState, error) {
@@ -71,12 +72,12 @@ func SendRecvStreamState(rw io.ReadWriter, s streamState) (streamState, error) {
 
 	// Make offset exchange concurrently
 	go func() {
-		err := binary.Write(rw, binary.BigEndian, s.UnacknowledgedBufSize)
+		err := binary.Write(rw, binary.BigEndian, s.CurrentReadStreamPos)
 		if err != nil {
 			werr <- err
 			return
 		}
-		err = binary.Write(rw, binary.BigEndian, s.UnacknowledgedByteCount)
+		err = binary.Write(rw, binary.BigEndian, s.UnacknowledgedBufSize)
 		if err != nil {
 			werr <- err
 			return
@@ -86,33 +87,51 @@ func SendRecvStreamState(rw io.ReadWriter, s streamState) (streamState, error) {
 			werr <- err
 			return
 		}
-		err = binary.Write(rw, binary.BigEndian, s.CurrentReadStreamPos)
+
+		err = binary.Write(rw, binary.BigEndian, uint32(len(s.UnacknowledgedBytes)))
 		if err != nil {
 			werr <- err
 			return
 		}
+
+		_, err = rw.Write(s.UnacknowledgedBytes)
+		if err != nil {
+			werr <- err
+			return
+		}
+
 		werr <- nil
 	}()
-
-	err := binary.Read(rw, binary.BigEndian, &theirState.UnacknowledgedBufSize)
-	if err != nil {
-		return streamState{}, err
-	}
-
-	err := binary.Read(rw, binary.BigEndian, &theirState.UnacknowledgedByteCount)
-	if err != nil {
-		return streamState{}, err
-	}
-
-	err := binary.Read(rw, binary.BigEndian, &theirState.UnacknowledgedStreamPos)
-	if err != nil {
-		return streamState{}, err
-	}
 
 	err := binary.Read(rw, binary.BigEndian, &theirState.CurrentReadStreamPos)
 	if err != nil {
 		return streamState{}, err
 	}
+
+	err = binary.Read(rw, binary.BigEndian, &theirState.UnacknowledgedBufSize)
+	if err != nil {
+		return streamState{}, err
+	}
+
+	err = binary.Read(rw, binary.BigEndian, &theirState.UnacknowledgedStreamPos)
+	if err != nil {
+		return streamState{}, err
+	}
+
+	var unacknowledgedByteCount uint32
+
+	err = binary.Read(rw, binary.BigEndian, &unacknowledgedByteCount)
+	if err != nil {
+		return streamState{}, err
+	}
+
+	unacknowledgedBytes := make([]byte, unacknowledgedByteCount, unacknowledgedByteCount)
+
+	_, err = io.ReadFull(rw, unacknowledgedBytes)
+	if err != nil {
+		return streamState{}, err
+	}
+	theirState.UnacknowledgedBytes = unacknowledgedBytes
 
 	err = <-werr
 	if err != nil {
@@ -122,30 +141,36 @@ func SendRecvStreamState(rw io.ReadWriter, s streamState) (streamState, error) {
 	return theirState, nil
 }
 
-const IOUNIT = 4096
+const READSZ = 4096
 
 type persistentState struct {
-	inIoUnits            chan []byte
-	outIoUnits           chan []byte
+	persistentIn         chan []byte
+	persistentOut        chan []byte
 	mutex                sync.Mutex
 	currentReadStreamPos uint64
 	lastSentAck          uint64
 	ub                   *unacknowledgedBuffer
 }
 
+// XXX ring buffer would be better
 func newUnacknowledgedBuffer(bufsz int) *unacknowledgedBuffer {
-	if bufsz < IOUNIT {
-		panic("BUFSZ SMALLER THAN IOUNIT")
+	// The minimum buffer is enough space for two in flight sends
+	// while the ack for the first is on its way back.
+
+	if bufsz/READSZ < 2 {
+		bufsz = READSZ * 2
 	}
 
 	return &unacknowledgedBuffer{
-		data: make([]byte, bufsz, 0),
+		data: make([]byte, 0, bufsz),
 	}
 }
 
 type unacknowledgedBuffer struct {
 	data      []byte
 	streamPos uint64
+
+	waiter chan struct{}
 }
 
 func (ub *unacknowledgedBuffer) Add(b []byte) {
@@ -169,11 +194,15 @@ func (ub *unacknowledgedBuffer) Free() uint64 {
 	return ub.Size() - ub.Used()
 }
 
+func (ub *unacknowledgedBuffer) Bytes() []byte {
+	return ub.data
+}
+
 func (ub *unacknowledgedBuffer) StreamPos() uint64 {
 	return ub.streamPos
 }
 
-func (ub *unacknowledgedBuffer) AckTill(offset uint64) error {
+func (ub *unacknowledgedBuffer) AckedTill(offset uint64) error {
 	if offset > ub.streamPos {
 		return errors.New("bad ack offset")
 	}
@@ -187,54 +216,68 @@ func (ub *unacknowledgedBuffer) AckTill(offset uint64) error {
 		ub.data[i] = ub.data[i+nToClear]
 	}
 	ub.data = ub.data[0:newSize]
+
+	if ub.Free() >= READSZ {
+		if ub.waiter != nil {
+			select {
+			case ub.waiter <- struct{}{}:
+			default:
+			}
+			ub.waiter = nil
+		}
+	}
+
 	return nil
 }
 
-func (ub *unacknowledgedBuffer) AwaitNFree(n uint64) chan struct{} {
-	ch := make(chan struct{}, 1)
-	panic("UNIMPLEMENTED")
+func (ub *unacknowledgedBuffer) AwaitReadSzFree() chan struct{} {
+	// We only need/support a single waiter...
+	ub.waiter = make(chan struct{}, 1)
+	if ub.Free() >= READSZ {
+		ub.waiter <- struct{}{}
+	}
+	return ub.waiter
 }
 
-func Proxy(persistent io.ReadWriteCloser, reconnect func() (io.ReadWriteCloser, error)) {
+func Proxy(persistent io.ReadWriteCloser, reconnect func() (io.ReadWriteCloser, error)) error {
 
 	st := &persistentState{
-		inIoUnits:  make(chan []byte, 1),
-		outIoUnits: make(chan []byte, 1),
-		ub:         newUnacknowledgedBuffer(1024 * 1024),
+		persistentIn:  make(chan []byte, 1),
+		persistentOut: make(chan []byte, 1),
+		ub:            newUnacknowledgedBuffer(1024 * 1024),
 	}
 	persistentErrors := make(chan error, 1)
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
 	wg := &sync.WaitGroup{}
+	defer wg.Wait()
 	once := &sync.Once{}
 
 	cancel := func() {
 		wg.Done()
 		once.Do(func() {
+			log.Print("persistent session shutting down")
 			_ = persistent.Close()
 			ctxCancel()
 		})
 	}
 
 	wg.Add(1)
-	defer cancel()
-	defer wg.Wait()
-
-	wg.Add(1)
 	go func() {
 		defer cancel()
-
-		buf := make([]byte, IOUNIT, IOUNIT)
+		
 		for {
+			buf := make([]byte, READSZ, READSZ)
 			n, err := persistent.Read(buf)
 			if err != nil {
 				select {
 				case persistentErrors <- err:
 				default:
 				}
+				return
 			}
 			select {
-			case st.inIoUnits <- buf[:n]:
+			case st.persistentIn <- buf[:n]:
 			case <-ctx.Done():
 				return
 			}
@@ -245,35 +288,41 @@ func Proxy(persistent io.ReadWriteCloser, reconnect func() (io.ReadWriteCloser, 
 	go func() {
 		defer cancel()
 
+		for {
 		select {
-		case buf := <-st.outIoUnits:
-			n, err := persistent.Write(buf)
-			if err != nil {
-				persistentErrors <- err
+			case buf := <-st.persistentOut:
+				_, err := persistent.Write(buf)
+				if err != nil {
+					select {
+					case persistentErrors <- err:
+					default:
+					}
+					return
+				}
+			case <-ctx.Done():
 				return
 			}
-		case <-ctx.Done():
-			return
 		}
 	}()
 
 	for {
 		transient, err := reconnect()
 		if err != nil {
-			// XXX parameter?.
+			log.Printf("transient reconnect failed: %s", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		proxy(st, transient)
+		proxy(ctx, st, transient)
 
 		select {
 		case err := <-persistentErrors:
-			return
+			return err
 		case <-ctx.Done():
-			return
+			return nil
 		}
 	}
+
 }
 
 func proxy(ctx context.Context, st *persistentState, transient io.ReadWriteCloser) {
@@ -283,40 +332,43 @@ func proxy(ctx context.Context, st *persistentState, transient io.ReadWriteClose
 
 	ctx, ctxCancel := context.WithCancel(ctx)
 	wg := &sync.WaitGroup{}
+	defer wg.Wait()
 	once := &sync.Once{}
 
 	cancel := func() {
 		wg.Done()
 		once.Do(func() {
+			log.Print("transient session shutting down")
 			_ = transient.Close()
 			ctxCancel()
 		})
 	}
 
-	wg.Add(1)
-	defer cancel()
-	defer wg.Wait()
-
 	st.mutex.Lock()
 	ss := streamState{
-		UnacknowledgedBufSize:   st.ub.Size(),
-		UnacknowledgedByteCount: st.ub.Used(),
-		UnacknowledgedStreamPos: st.ub.StreamPos(),
 		CurrentReadStreamPos:    st.currentReadStreamPos,
+		UnacknowledgedBufSize:   st.ub.Size(),
+		UnacknowledgedStreamPos: st.ub.StreamPos(),
+		UnacknowledgedBytes:     st.ub.Bytes(),
 	}
 	st.mutex.Unlock()
 
 	theirState, err := SendRecvStreamState(transient, ss)
 	if err != nil {
+		log.Printf("syncing stream state failed: %s", err)
 		return
 	}
 
-	// XXX TODO resend rerecv unacknowledged
+	log.Printf("got stream states : %#v %#v", ss, theirState)
 
-	st.mutex.Lock()
-	// XXX TODO recalculate stream positions
-	// XXX
-	st.mutex.Unlock()
+	select {
+	case st.persistentOut <- theirState.UnacknowledgedBytes:
+		st.mutex.Lock()
+		st.ub.AckedTill(st.ub.StreamPos() + st.ub.Used())
+		st.mutex.Unlock()
+	case <-ctx.Done():
+		return
+	}
 
 	wg.Add(1)
 	go func() {
@@ -325,8 +377,9 @@ func proxy(ctx context.Context, st *persistentState, transient io.ReadWriteClose
 		for {
 			select {
 			case p := <-packetOut:
-				_, err := WritePacket(transient, p)
+				err := WritePacket(transient, p)
 				if err != nil {
+					log.Printf("transient io error: %s", err)
 					return
 				}
 			case <-ctx.Done():
@@ -342,6 +395,7 @@ func proxy(ctx context.Context, st *persistentState, transient io.ReadWriteClose
 		for {
 			p, err := ReadPacket(transient)
 			if err != nil {
+				log.Printf("transient io error: %s", err)
 				return
 			}
 			select {
@@ -359,29 +413,34 @@ func proxy(ctx context.Context, st *persistentState, transient io.ReadWriteClose
 		for {
 
 			st.mutex.Lock()
-			notifyReady := st.ub.AwaitNFree(IOUNIT)
+			notifyReady := st.ub.AwaitReadSzFree()
 			st.mutex.Unlock()
 
+			log.Printf("awaiting read space in buffer")
 			select {
 			case <-notifyReady:
 			case <-ctx.Done():
 				return
 			}
+			log.Printf("enough read space in buffer")
 
 			var toSend []byte
 
+			log.Printf("waiting for next read")
 			select {
-			case toSend = <-st.inIoUnits:
+			case toSend = <-st.persistentIn:
 			case <-ctx.Done():
 				return
 			}
+			log.Printf("read %d bytes", len(toSend))
 
 			st.mutex.Lock()
 			st.ub.Add(toSend)
-			currentReadStreamPos := st.readStreamPos
+			currentReadStreamPos := st.currentReadStreamPos
 			st.lastSentAck = currentReadStreamPos
 			st.mutex.Unlock()
 
+			log.Printf("sending some data and an ack till offset %d", currentReadStreamPos)
 			select {
 			case packetOut <- Packet{Data: toSend, Ack: currentReadStreamPos}:
 			case <-ctx.Done():
@@ -405,26 +464,25 @@ func proxy(ctx context.Context, st *persistentState, transient io.ReadWriteClose
 			}
 
 			st.mutex.Lock()
-			err := st.ub.AckTill(p.Ack)
+			err := st.ub.AckedTill(p.Ack)
 			st.mutex.Unlock()
 			if err != nil {
-				st <- p
 				return
 			}
 
 			select {
-			case st.outIoUnits <- p.Data:
+			case st.persistentOut <- p.Data:
 			case <-ctx.Done():
 				return
 			}
 
 			st.mutex.Lock()
-			st.currentReadStreamPos += len(p.Data)
+			st.currentReadStreamPos += uint64(len(p.Data))
 			readStreamPos := st.currentReadStreamPos
 			lastSentAck := st.lastSentAck
 			st.mutex.Unlock()
 
-			if readStreamPos-lastSentAck > (ss.UnacknowledgedBufSize / 2) {
+			if readStreamPos-lastSentAck >= (ss.UnacknowledgedBufSize / 2) {
 				// The remote end is running out of buffer space.
 				// Preemptively send him an ack, but only if
 				// we aren't already sending one.
@@ -437,6 +495,4 @@ func proxy(ctx context.Context, st *persistentState, transient io.ReadWriteClose
 			}
 		}
 	}()
-
-	wg.Wait()
 }
