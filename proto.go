@@ -482,7 +482,7 @@ func proxy(ctx context.Context, st *persistentState, transient io.ReadWriteClose
 			lastSentAck := st.lastSentAck
 			st.mutex.Unlock()
 
-			if readStreamPos-lastSentAck >= (ss.UnacknowledgedBufSize / 2) {
+			if readStreamPos-lastSentAck > (theirState.UnacknowledgedBufSize / 2) {
 				// The remote end is running out of buffer space.
 				// Preemptively send him an ack, but only if
 				// we aren't already sending one.
